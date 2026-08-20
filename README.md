@@ -14,7 +14,7 @@ the IOAPIC:
 ```text
 fec00000-ffffffff : Reserved
   fec00000-fec003ff : IOAPIC 0
-````
+```
 
 The current Linux `sp5100_tco` driver therefore fails to reserve the watchdog
 region:
