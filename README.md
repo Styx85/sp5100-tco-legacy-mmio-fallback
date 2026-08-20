@@ -180,6 +180,40 @@ modinfo ./sp5100_tco.ko
 
 The module `vermagic` must match the running kernel.
 
+## DKMS installation
+
+For persistent use across kernel updates, the repository includes a
+`dkms.conf`.
+
+Install DKMS and the kernel headers:
+
+    sudo pacman -S --needed dkms linux-headers
+
+Register the source tree with DKMS:
+
+    sudo dkms add "$PWD"
+    sudo dkms install sp5100-tco-legacy/0.1
+
+Check the installation:
+
+    dkms status
+    modinfo -n sp5100_tco
+
+The module should be loaded from a DKMS-managed path such as:
+
+    /usr/lib/modules/<kernel>/updates/dkms/sp5100_tco.ko.zst
+
+To load the patched driver automatically at boot:
+
+    echo sp5100_tco | sudo tee /etc/modules-load.d/sp5100_tco.conf
+
+Arch Linux DKMS hooks rebuild and reinstall the module when a supported
+kernel is updated.
+
+If the upstream `sp5100_tco` driver changes substantially, a future kernel
+may require this external module to be updated before DKMS can build it
+successfully.
+
 ## Experimental loading
 
 Remove the in-tree driver if loaded:
