@@ -149,7 +149,7 @@ sp5100_tco.h
     Corresponding driver header.
 
 patches/
-    Patch against Linux v7.1.8.
+    Final upstream-style git format-patch submission.
 
 read-amd-pm.c
     Diagnostic helper for reading AMD PM registers.
