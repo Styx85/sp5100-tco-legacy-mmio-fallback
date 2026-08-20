@@ -1,0 +1,146 @@
+--- a/drivers/watchdog/sp5100_tco.c
++++ b/drivers/watchdog/sp5100_tco.c
+@@ -229,6 +229,126 @@
+ 	}
+ }
+ 
++static u32 sp5100_tco_prepare_base(struct sp5100_tco *tco,
++				   u32 mmio_addr,
++				   u32 alt_mmio_addr,
++				   const char *dev_name);
++
++/*
++ * Legacy SP5100/SB7x0 fallback.
++ *
++ * Some firmware uses 0xfec000f0 for the watchdog MMIO window.
++ * This may overlap the IOAPIC resource. Historical Linux versions
++ * relocated the watchdog to a free 8-byte MMIO window and
++ * reprogrammed PM registers 0x6c..0x6f.
++ */
++static struct resource sp5100_tco_fallback_res = {
++	.name = "SP5100 TCO fallback",
++	.flags = IORESOURCE_MEM,
++};
++
++static void sp5100_tco_release_fallback(void *data)
++{
++	struct resource *res = data;
++
++	if (res->parent)
++		release_resource(res);
++}
++
++static void sp5100_tco_write_pm_reg8(u8 index, u8 val)
++{
++	outb(index, SP5100_IO_PM_INDEX_REG);
++	outb(val, SP5100_IO_PM_DATA_REG);
++}
++
++static struct resource *
++sp5100_tco_find_parent_resource(resource_size_t start, resource_size_t end)
++{
++	struct resource *res;
++
++	for (res = iomem_resource.child; res; res = res->sibling) {
++		if (start >= res->start && end <= res->end)
++			return res;
++	}
++
++	return NULL;
++}
++
++static int sp5100_tco_reprogram_base(struct sp5100_tco *tco,
++				     const char *dev_name)
++{
++	struct device *dev = tco->wdd.parent;
++	struct resource *parent;
++	u32 mmio_addr = 0xfec00800;
++	u8 low_reserved;
++	int ret;
++	int i;
++
++	sp5100_tco_fallback_res.start = mmio_addr;
++	sp5100_tco_fallback_res.end =
++		mmio_addr + SP5100_WDT_MEM_MAP_SIZE - 1;
++
++	parent = sp5100_tco_find_parent_resource(
++		sp5100_tco_fallback_res.start,
++		sp5100_tco_fallback_res.end);
++
++	if (!parent) {
++		dev_err(dev,
++			"No parent MMIO resource found for fallback address 0x%08x\n",
++			mmio_addr);
++		return -ENODEV;
++	}
++
++	ret = request_resource(parent, &sp5100_tco_fallback_res);
++	if (ret) {
++		dev_err(dev,
++			"Fallback watchdog MMIO 0x%08x conflicts with existing child resource\n",
++			mmio_addr);
++		return ret;
++	}
++
++	ret = devm_add_action_or_reset(dev, sp5100_tco_release_fallback,
++				       &sp5100_tco_fallback_res);
++	if (ret)
++		return ret;
++
++	/* Disable watchdog before changing its decode address. */
++	sp5100_tco_update_pm_reg8(SP5100_PM_WATCHDOG_CONTROL,
++				  0xff,
++				  SP5100_PM_WATCHDOG_DISABLE);
++
++	low_reserved =
++		sp5100_tco_read_pm_reg8(SP5100_PM_WATCHDOG_BASE) & 0x07;
++
++	for (i = 0; i < 4; i++) {
++		u8 val = (mmio_addr >> (8 * i)) & 0xff;
++
++		if (i == 0)
++			val |= low_reserved;
++
++		sp5100_tco_write_pm_reg8(SP5100_PM_WATCHDOG_BASE + i, val);
++	}
++
++	dev_info(dev,
++		 "Reprogrammed legacy SP5100 watchdog MMIO to 0x%08x\n",
++		 mmio_addr);
++
++	tco->tcobase = devm_ioremap(dev, mmio_addr,
++				    SP5100_WDT_MEM_MAP_SIZE);
++	if (!tco->tcobase) {
++		dev_err(dev,
++			"Fallback MMIO address 0x%08x failed mapping\n",
++			mmio_addr);
++		return -ENOMEM;
++	}
++
++	dev_info(dev,
++		 "Using relocated 0x%08x for watchdog MMIO address\n",
++		 mmio_addr);
++
++	return 0;
++}
++
+ static u32 sp5100_tco_read_pm_reg32(u8 index)
+ {
+ 	u32 val = 0;
+@@ -492,6 +612,16 @@
+ 	}
+ 
+ 	ret = sp5100_tco_prepare_base(tco, mmio_addr, alt_mmio_addr, dev_name);
++
++	/*
++	 * Legacy SP5100/SB7x0 firmware commonly uses 0xfec000f0,
++	 * which can overlap the IOAPIC resource. If neither firmware
++	 * MMIO location can be reserved, restore the historical
++	 * relocation fallback.
++	 */
++	if (ret == -EBUSY && tco->tco_reg_layout == sp5100)
++		ret = sp5100_tco_reprogram_base(tco, dev_name);
++
+ 	if (!ret) {
+ 		/* Setup the watchdog timer */
+ 		tco_timer_enable(tco);
