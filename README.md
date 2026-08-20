@@ -1,6 +1,6 @@
 # sp5100-tco legacy MMIO relocation fallback
 
-Experimental Linux `sp5100_tco` watchdog driver patch restoring a legacy
+Experimental Linux `sp5100_tco` watchdog driver patch adding a reversible
 MMIO relocation mechanism for older AMD SP5100/SB7x0 southbridges.
 
 ## Background
@@ -24,11 +24,24 @@ sp5100-tco: Failed to reserve MMIO or alternate MMIO region
 sp5100-tco: probe with driver sp5100-tco failed with error -16
 ```
 
-Older versions of the Linux driver contained a fallback that could relocate
-the watchdog MMIO window and reprogram its PM configuration registers.
+Linux previously contained a relocation mechanism for this class of conflict.
 
-This repository experimentally restores that behavior for legacy `sp5100`
-register-layout hardware.
+It was introduced for Linux 3.8 by commit 740fbddf5c3f
+("watchdog: sp5100_tco: Add SB8x0 chipset support").
+
+The mechanism was deliberately removed shortly afterwards by commit
+18e4321276fc ("watchdog: sp5100_tco: Remove code that may cause a boot
+failure") after an SB700 system failed to load BIOS after running a kernel
+containing the relocation path until power was completely removed.
+
+The exact root cause of that historical failure is not documented. One
+relevant difference is that the old relocation path reprogrammed the watchdog
+base but did not restore the firmware-programmed PM register state when the
+driver was removed.
+
+This repository therefore implements relocation as a reversible operation:
+the original PM control and base registers are saved before reprogramming and
+restored on probe failure or device removal.
 
 ## Tested hardware
 
@@ -41,7 +54,10 @@ Tested on:
 * PCI ID: `1002:4385`
 * PCI revision: `0x3c`
 * Arch Linux
-* Kernel tested: `7.1.8-arch1-3`
+* Hardware-tested kernel: `7.1.8-arch1-3`
+
+The `sp5100_tco.c` driver in current upstream Linux mainline was verified to
+be identical to the Linux 7.1.8 version used for the hardware tests.
 
 ## Original watchdog configuration
 
@@ -218,6 +234,10 @@ Verified:
 * the resource is represented correctly in `/proc/iomem`
 * `sp5100_tco` initializes successfully
 * `/dev/watchdog0` is registered
+* the original PM control and base registers are restored on module removal
+* the relocated resource disappears from `/proc/iomem` on module removal
+* the final upstream patch passes `checkpatch.pl --strict` with 0 errors,
+  0 warnings and 0 checks
 
 A deliberate hardware watchdog timeout/reset has not yet been tested.
 
@@ -234,6 +254,9 @@ southbridge watchdog and MMIO resource layout involved.
 
 ## License
 
-The Linux `sp5100_tco` driver is licensed under GPL-2.0-only.
+The source files retain their upstream Linux SPDX license declarations.
 
-Changes in this repository are distributed under the same license.
+`sp5100_tco.c` uses `GPL-2.0-or-later`, while `sp5100_tco.h` uses `GPL-2.0`.
+
+The repository contains the GNU General Public License version 2 text in
+`LICENSE`.

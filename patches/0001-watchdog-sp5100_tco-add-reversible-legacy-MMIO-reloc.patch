@@ -1,39 +1,87 @@
+From c495fdd9a97f51e18eb5806035209440da344c21 Mon Sep 17 00:00:00 2001
 From: Christoph Berliner <caberliner@gmail.com>
-Subject: [PATCH] watchdog: sp5100_tco: restore legacy MMIO relocation
+Date: Fri, 21 Aug 2026 00:01:18 +0200
+Subject: [PATCH] watchdog: sp5100_tco: add reversible legacy MMIO relocation
 
 Older SP5100/SB7x0 systems may provide a watchdog MMIO base that
 overlaps another reserved resource. On the tested system firmware
 programs the watchdog at 0xfec000f0, which falls inside the IOAPIC
 resource and causes sp5100_tco to fail probing with -EBUSY.
 
-Older versions of the driver supported relocating the watchdog MMIO
-window when the firmware-provided address could not be used.
+A relocation mechanism for this class of conflict was introduced by
+commit 740fbddf5c3f ("watchdog: sp5100_tco: Add SB8x0 chipset support")
+for Linux 3.8.
 
-Restore that behavior for the legacy SP5100 register layout. Locate the
-top-level firmware-reserved MMIO resource containing the conflicting
-address and search it for a free, naturally aligned 8-byte child
-resource. Use request_resource() for conflict checking instead of
+It was deliberately removed shortly afterwards by commit 18e4321276fc
+("watchdog: sp5100_tco: Remove code that may cause a boot failure")
+after an SB700 machine failed to load BIOS after running a kernel
+containing the relocation path until power was completely removed.
+
+The exact cause of that failure is not documented. One relevant
+difference is that the old relocation path reprogrammed the watchdog
+base but did not restore the firmware-programmed PM register state when
+the driver was removed.
+
+Add a reversible relocation path for the legacy SP5100 register layout.
+Locate the top-level firmware-reserved MMIO resource containing the
+conflicting address and search it for a free, naturally aligned 8-byte
+child resource.
+
+Use request_resource() for conflict checking instead of
 allocate_resource(), since x86 dynamic resource allocation excludes
 E820-reserved address ranges.
 
-Reprogram the SP5100 watchdog base registers to the selected address
-while preserving the reserved low bits. Save the original PM register
-state and restore it on probe failure or device removal, together with
-releasing the relocated resource.
+Before reprogramming the watchdog, save the original PM control and base
+registers. Restore them on probe failure or device removal and release
+the relocated resource.
 
-On the tested system the driver relocates the watchdog from 0xfec000f0
-to the first free slot at 0xfec00400, registers /dev/watchdog0
-successfully, and restores the firmware state when the module is
-removed.
+On the tested system the complete lifecycle is:
 
-Tested with Linux 7.1.8 on an AMD SBx00 SMBus controller
-(PCI 1002:4385, revision 0x3c).
+  firmware:  0xfec000f0, PM control 0x03
+  relocated: 0xfec00400, PM control 0x06
+  restored:  0xfec000f0, PM control 0x03
+
+The relocated resource is registered correctly in /proc/iomem,
+the watchdog registers successfully as /dev/watchdog0, and unloading
+the module restores both the original firmware address and control
+register.
+
+Tested on Linux 7.1.8 with an AMD SBx00 SMBus controller
+(PCI 1002:4385, revision 0x3c). The sp5100_tco.c driver in current
+mainline is identical to the tested 7.1.8 version.
 
 Signed-off-by: Christoph Berliner <caberliner@gmail.com>
 ---
+Hi Wim, Guenter,
+
+A note on context: I am a physician, not a software developer. This
+watchdog issue has annoyed me for quite some time on an older machine
+that I still use. Current AI-assisted programming tools finally gave me
+a practical way to investigate it in enough depth to trace the firmware
+configuration, historical driver behavior and kernel resource handling,
+and to build and test a possible fix on the actual hardware.
+
+While investigating the history I found the 2013 SB700 regression that
+led to removal of the old relocation path. I do not have the machine
+affected by that regression and therefore cannot establish its exact
+root cause. The reversible restoration of the firmware-programmed PM
+state in this patch is intended to address one important difference
+from the old implementation.
+
+I consider this a hardware-tested proposal rather than the work of an
+experienced kernel developer. I would particularly appreciate review
+of whether restoring the original PM state sufficiently addresses the
+risk that led to commit 18e4321276fc ("watchdog: sp5100_tco: Remove
+code that may cause a boot failure").
+
+ drivers/watchdog/sp5100_tco.c | 255 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 251 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/watchdog/sp5100_tco.c b/drivers/watchdog/sp5100_tco.c
+index 7e99c3b1f367..d21339d07942 100644
 --- a/drivers/watchdog/sp5100_tco.c
 +++ b/drivers/watchdog/sp5100_tco.c
-@@ -229,6 +229,231 @@
+@@ -229,6 +229,231 @@ static void tco_timer_enable(struct sp5100_tco *tco)
  	}
  }
  
@@ -265,7 +313,7 @@ Signed-off-by: Christoph Berliner <caberliner@gmail.com>
  static u32 sp5100_tco_read_pm_reg32(u8 index)
  {
  	u32 val = 0;
-@@ -256,7 +481,8 @@
+@@ -256,7 +481,8 @@ static u32 sp5100_tco_request_region(struct device *dev,
  static u32 sp5100_tco_prepare_base(struct sp5100_tco *tco,
  				   u32 mmio_addr,
  				   u32 alt_mmio_addr,
@@ -275,7 +323,7 @@ Signed-off-by: Christoph Berliner <caberliner@gmail.com>
  {
  	struct device *dev = tco->wdd.parent;
  
-@@ -273,7 +499,9 @@
+@@ -273,7 +499,9 @@ static u32 sp5100_tco_prepare_base(struct sp5100_tco *tco,
  		mmio_addr = sp5100_tco_request_region(dev, alt_mmio_addr, dev_name);
  
  	if (!mmio_addr) {
@@ -286,7 +334,7 @@ Signed-off-by: Christoph Berliner <caberliner@gmail.com>
  		return -EBUSY;
  	}
  
-@@ -405,7 +633,7 @@
+@@ -405,7 +633,7 @@ static int sp5100_tco_setupdevice_mmio(struct device *dev,
  		alt_mmio_addr = EFCH_PM_ACPI_MMIO_ADDR +
  			EFCH_PM_ACPI_MMIO_WDT_OFFSET;
  
@@ -295,7 +343,7 @@ Signed-off-by: Christoph Berliner <caberliner@gmail.com>
  	if (!ret) {
  		tco_timer_enable_mmio(addr);
  		ret = sp5100_tco_timer_init(tco);
-@@ -428,6 +656,8 @@
+@@ -428,6 +656,8 @@ static int sp5100_tco_setupdevice(struct device *dev,
  	const char *dev_name;
  	u32 mmio_addr = 0, val;
  	u32 alt_mmio_addr = 0;
@@ -304,7 +352,7 @@ Signed-off-by: Christoph Berliner <caberliner@gmail.com>
  	int ret;
  
  	if (tco->tco_reg_layout == efch_mmio)
-@@ -491,7 +721,24 @@
+@@ -491,7 +721,24 @@ static int sp5100_tco_setupdevice(struct device *dev,
  		return -ENODEV;
  	}
  
@@ -330,3 +378,6 @@ Signed-off-by: Christoph Berliner <caberliner@gmail.com>
  	if (!ret) {
  		/* Setup the watchdog timer */
  		tco_timer_enable(tco);
+-- 
+2.55.0
+
