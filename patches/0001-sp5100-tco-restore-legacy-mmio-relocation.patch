@@ -1,13 +1,47 @@
+From: Christoph Berliner <caberliner@gmail.com>
+Subject: [PATCH] watchdog: sp5100_tco: restore legacy MMIO relocation
+
+Older SP5100/SB7x0 systems may provide a watchdog MMIO base that
+overlaps another reserved resource. On the tested system firmware
+programs the watchdog at 0xfec000f0, which falls inside the IOAPIC
+resource and causes sp5100_tco to fail probing with -EBUSY.
+
+Older versions of the driver supported relocating the watchdog MMIO
+window when the firmware-provided address could not be used.
+
+Restore that behavior for the legacy SP5100 register layout. Locate the
+top-level firmware-reserved MMIO resource containing the conflicting
+address and search it for a free, naturally aligned 8-byte child
+resource. Use request_resource() for conflict checking instead of
+allocate_resource(), since x86 dynamic resource allocation excludes
+E820-reserved address ranges.
+
+Reprogram the SP5100 watchdog base registers to the selected address
+while preserving the reserved low bits. Save the original PM register
+state and restore it on probe failure or device removal, together with
+releasing the relocated resource.
+
+On the tested system the driver relocates the watchdog from 0xfec000f0
+to the first free slot at 0xfec00400, registers /dev/watchdog0
+successfully, and restores the firmware state when the module is
+removed.
+
+Tested with Linux 7.1.8 on an AMD SBx00 SMBus controller
+(PCI 1002:4385, revision 0x3c).
+
+Signed-off-by: Christoph Berliner <caberliner@gmail.com>
+---
 --- a/drivers/watchdog/sp5100_tco.c
 +++ b/drivers/watchdog/sp5100_tco.c
-@@ -229,6 +229,126 @@
+@@ -229,6 +229,231 @@
  	}
  }
  
 +static u32 sp5100_tco_prepare_base(struct sp5100_tco *tco,
 +				   u32 mmio_addr,
 +				   u32 alt_mmio_addr,
-+				   const char *dev_name);
++				   const char *dev_name,
++				   bool report_error);
 +
 +/*
 + * Legacy SP5100/SB7x0 fallback.
@@ -17,102 +51,206 @@
 + * relocated the watchdog to a free 8-byte MMIO window and
 + * reprogrammed PM registers 0x6c..0x6f.
 + */
-+static struct resource sp5100_tco_fallback_res = {
-+	.name = "SP5100 TCO fallback",
-+	.flags = IORESOURCE_MEM,
-+};
-+
-+static void sp5100_tco_release_fallback(void *data)
-+{
-+	struct resource *res = data;
-+
-+	if (res->parent)
-+		release_resource(res);
-+}
-+
 +static void sp5100_tco_write_pm_reg8(u8 index, u8 val)
 +{
 +	outb(index, SP5100_IO_PM_INDEX_REG);
 +	outb(val, SP5100_IO_PM_DATA_REG);
 +}
 +
++struct sp5100_tco_relocation {
++	struct resource res;
++	u8 saved_control;
++	u8 saved_base[4];
++	bool programmed;
++};
++
++static void sp5100_tco_release_relocation(void *data)
++{
++	struct sp5100_tco_relocation *reloc = data;
++	int i;
++
++	if (reloc->programmed &&
++	    request_muxed_region(SP5100_IO_PM_INDEX_REG,
++				 SP5100_PM_IOPORTS_SIZE,
++				 "sp5100_tco restore")) {
++		/*
++		 * Disable decoding while restoring the original base.
++		 */
++		sp5100_tco_update_pm_reg8(SP5100_PM_WATCHDOG_CONTROL,
++					  0xff,
++					  SP5100_PM_WATCHDOG_DISABLE);
++
++		for (i = 0; i < 4; i++)
++			sp5100_tco_write_pm_reg8(SP5100_PM_WATCHDOG_BASE + i,
++						 reloc->saved_base[i]);
++
++		sp5100_tco_write_pm_reg8(SP5100_PM_WATCHDOG_CONTROL,
++					 reloc->saved_control);
++
++		release_region(SP5100_IO_PM_INDEX_REG,
++			       SP5100_PM_IOPORTS_SIZE);
++	}
++
++	if (reloc->res.parent)
++		release_resource(&reloc->res);
++}
++
++/*
++ * Find the top-level firmware resource containing the conflicting
++ * watchdog address.  The watchdog can then be allocated as a sibling
++ * of resources such as the IOAPIC rather than as a child of them.
++ */
 +static struct resource *
-+sp5100_tco_find_parent_resource(resource_size_t start, resource_size_t end)
++sp5100_tco_find_parent_resource(resource_size_t addr)
 +{
 +	struct resource *res;
 +
 +	for (res = iomem_resource.child; res; res = res->sibling) {
-+		if (start >= res->start && end <= res->end)
++		if (addr >= res->start && addr <= res->end)
 +			return res;
 +	}
 +
 +	return NULL;
 +}
 +
++/*
++ * Older SP5100/SB7x0 firmware may place the watchdog MMIO window inside
++ * another reserved resource, historically most notably the IOAPIC area.
++ *
++ * The old Linux driver could relocate the watchdog when its firmware
++ * supplied address was unusable.  Modern resource trees may expose one
++ * large firmware-reserved parent with individual resources below it.
++ *
++ * Allocate an unused, naturally aligned watchdog-sized child resource
++ * inside that parent and reprogram the SP5100 watchdog base registers.
++ */
 +static int sp5100_tco_reprogram_base(struct sp5100_tco *tco,
++				     u32 conflict_addr,
 +				     const char *dev_name)
 +{
 +	struct device *dev = tco->wdd.parent;
 +	struct resource *parent;
-+	u32 mmio_addr = 0xfec00800;
-+	u8 low_reserved;
++	struct sp5100_tco_relocation *reloc;
++	struct resource *res;
++	resource_size_t candidate;
++	resource_size_t max_addr;
++	u32 mmio_addr;
++	u8 base0_reserved;
 +	int ret;
 +	int i;
 +
-+	sp5100_tco_fallback_res.start = mmio_addr;
-+	sp5100_tco_fallback_res.end =
-+		mmio_addr + SP5100_WDT_MEM_MAP_SIZE - 1;
-+
-+	parent = sp5100_tco_find_parent_resource(
-+		sp5100_tco_fallback_res.start,
-+		sp5100_tco_fallback_res.end);
-+
++	parent = sp5100_tco_find_parent_resource(conflict_addr);
 +	if (!parent) {
 +		dev_err(dev,
-+			"No parent MMIO resource found for fallback address 0x%08x\n",
-+			mmio_addr);
++			"No parent MMIO resource contains conflicting watchdog address 0x%08x\n",
++			conflict_addr);
 +		return -ENODEV;
 +	}
 +
-+	ret = request_resource(parent, &sp5100_tco_fallback_res);
-+	if (ret) {
-+		dev_err(dev,
-+			"Fallback watchdog MMIO 0x%08x conflicts with existing child resource\n",
-+			mmio_addr);
-+		return ret;
++	/*
++	 * The SP5100 watchdog base is a 32-bit physical address.
++	 */
++	if (parent->start > U32_MAX)
++		return -ERANGE;
++
++	max_addr = min_t(resource_size_t, parent->end, U32_MAX);
++
++	reloc = devm_kzalloc(dev, sizeof(*reloc), GFP_KERNEL);
++	if (!reloc)
++		return -ENOMEM;
++
++	res = &reloc->res;
++	res->name = dev_name;
++	res->flags = IORESOURCE_MEM;
++
++	/*
++	 * Do not use allocate_resource() here.
++	 *
++	 * On x86, dynamic resource allocation excludes E820-reserved
++	 * address ranges. Legacy SP5100 firmware may deliberately place
++	 * the watchdog inside such a reserved parent resource.
++	 *
++	 * Try naturally aligned watchdog-sized slots inside the existing
++	 * parent. request_resource() performs the actual conflict check
++	 * while holding the resource lock.
++	 */
++	candidate = ALIGN(parent->start, SP5100_WDT_MEM_MAP_SIZE);
++
++	for (;;) {
++		if (candidate > max_addr ||
++		    max_addr - candidate + 1 < SP5100_WDT_MEM_MAP_SIZE) {
++			dev_err(dev,
++				"No free watchdog MMIO slot found inside %pR\n",
++				parent);
++			return -EBUSY;
++		}
++
++		res->start = candidate;
++		res->end = candidate + SP5100_WDT_MEM_MAP_SIZE - 1;
++
++		ret = request_resource(parent, res);
++		if (!ret)
++			break;
++
++		if (ret != -EBUSY)
++			return ret;
++
++		candidate += SP5100_WDT_MEM_MAP_SIZE;
 +	}
 +
-+	ret = devm_add_action_or_reset(dev, sp5100_tco_release_fallback,
-+				       &sp5100_tco_fallback_res);
++	/*
++	 * Save the firmware-provided watchdog state before changing it.
++	 * The devm cleanup action restores it on probe failure or device
++	 * removal and releases the relocated resource.
++	 */
++	reloc->saved_control =
++		sp5100_tco_read_pm_reg8(SP5100_PM_WATCHDOG_CONTROL);
++
++	for (i = 0; i < 4; i++)
++		reloc->saved_base[i] =
++			sp5100_tco_read_pm_reg8(SP5100_PM_WATCHDOG_BASE + i);
++
++	ret = devm_add_action_or_reset(dev,
++				       sp5100_tco_release_relocation,
++				       reloc);
 +	if (ret)
 +		return ret;
 +
-+	/* Disable watchdog before changing its decode address. */
++	mmio_addr = (u32)res->start;
++
++	/*
++	 * Disable the watchdog before changing its decode address.
++	 */
 +	sp5100_tco_update_pm_reg8(SP5100_PM_WATCHDOG_CONTROL,
 +				  0xff,
 +				  SP5100_PM_WATCHDOG_DISABLE);
 +
-+	low_reserved =
-+		sp5100_tco_read_pm_reg8(SP5100_PM_WATCHDOG_BASE) & 0x07;
++	/*
++	 * Preserve the reserved low three bits of BASE0 while
++	 * reprogramming the aligned watchdog address.
++	 */
++	base0_reserved = reloc->saved_base[0] & 0x07;
 +
 +	for (i = 0; i < 4; i++) {
 +		u8 val = (mmio_addr >> (8 * i)) & 0xff;
 +
-+		if (i == 0)
-+			val |= low_reserved;
++		if (!i)
++			val |= base0_reserved;
 +
 +		sp5100_tco_write_pm_reg8(SP5100_PM_WATCHDOG_BASE + i, val);
 +	}
 +
++	reloc->programmed = true;
++
 +	dev_info(dev,
-+		 "Reprogrammed legacy SP5100 watchdog MMIO to 0x%08x\n",
-+		 mmio_addr);
++		 "Relocated legacy SP5100 watchdog MMIO from 0x%08x to 0x%08x\n",
++		 conflict_addr, mmio_addr);
 +
 +	tco->tcobase = devm_ioremap(dev, mmio_addr,
 +				    SP5100_WDT_MEM_MAP_SIZE);
 +	if (!tco->tcobase) {
 +		dev_err(dev,
-+			"Fallback MMIO address 0x%08x failed mapping\n",
++			"Relocated watchdog MMIO address 0x%08x failed mapping\n",
 +			mmio_addr);
 +		return -ENOMEM;
 +	}
@@ -127,10 +265,52 @@
  static u32 sp5100_tco_read_pm_reg32(u8 index)
  {
  	u32 val = 0;
-@@ -492,6 +612,16 @@
+@@ -256,7 +481,8 @@
+ static u32 sp5100_tco_prepare_base(struct sp5100_tco *tco,
+ 				   u32 mmio_addr,
+ 				   u32 alt_mmio_addr,
+-				   const char *dev_name)
++				   const char *dev_name,
++				   bool report_error)
+ {
+ 	struct device *dev = tco->wdd.parent;
+ 
+@@ -273,7 +499,9 @@
+ 		mmio_addr = sp5100_tco_request_region(dev, alt_mmio_addr, dev_name);
+ 
+ 	if (!mmio_addr) {
+-		dev_err(dev, "Failed to reserve MMIO or alternate MMIO region\n");
++		if (report_error)
++			dev_err(dev,
++				"Failed to reserve MMIO or alternate MMIO region\n");
+ 		return -EBUSY;
  	}
  
- 	ret = sp5100_tco_prepare_base(tco, mmio_addr, alt_mmio_addr, dev_name);
+@@ -405,7 +633,7 @@
+ 		alt_mmio_addr = EFCH_PM_ACPI_MMIO_ADDR +
+ 			EFCH_PM_ACPI_MMIO_WDT_OFFSET;
+ 
+-	ret = sp5100_tco_prepare_base(tco, mmio_addr, alt_mmio_addr, dev_name);
++	ret = sp5100_tco_prepare_base(tco, mmio_addr, alt_mmio_addr, dev_name, true);
+ 	if (!ret) {
+ 		tco_timer_enable_mmio(addr);
+ 		ret = sp5100_tco_timer_init(tco);
+@@ -428,6 +656,8 @@
+ 	const char *dev_name;
+ 	u32 mmio_addr = 0, val;
+ 	u32 alt_mmio_addr = 0;
++	u32 conflict_addr;
++	bool report_error;
+ 	int ret;
+ 
+ 	if (tco->tco_reg_layout == efch_mmio)
+@@ -491,7 +721,24 @@
+ 		return -ENODEV;
+ 	}
+ 
+-	ret = sp5100_tco_prepare_base(tco, mmio_addr, alt_mmio_addr, dev_name);
++	report_error = tco->tco_reg_layout != sp5100;
++	ret = sp5100_tco_prepare_base(tco, mmio_addr, alt_mmio_addr, dev_name, report_error);
 +
 +	/*
 +	 * Legacy SP5100/SB7x0 firmware commonly uses 0xfec000f0,
@@ -138,8 +318,14 @@
 +	 * MMIO location can be reserved, restore the historical
 +	 * relocation fallback.
 +	 */
-+	if (ret == -EBUSY && tco->tco_reg_layout == sp5100)
-+		ret = sp5100_tco_reprogram_base(tco, dev_name);
++	if (ret == -EBUSY && tco->tco_reg_layout == sp5100) {
++		conflict_addr = mmio_addr ? mmio_addr : alt_mmio_addr;
++		ret = sp5100_tco_reprogram_base(tco, conflict_addr, dev_name);
++		if (ret)
++			dev_err(dev,
++				"Failed to reserve or relocate watchdog MMIO region: %d\n",
++				ret);
++	}
 +
  	if (!ret) {
  		/* Setup the watchdog timer */

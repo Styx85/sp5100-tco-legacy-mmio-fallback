@@ -66,10 +66,13 @@ This address overlaps the IOAPIC kernel resource.
 
 ## Relocation
 
-The experimental fallback relocates the watchdog to:
+The experimental fallback dynamically locates a free, naturally aligned
+8-byte child resource inside the existing firmware-reserved MMIO parent.
+
+On the tested system the first available range is:
 
 ```text
-0xfec00800
+0xfec00400
 ```
 
 The patched driver registers this range as a child resource of the existing
@@ -78,28 +81,27 @@ firmware-reserved MMIO window:
 ```text
 fec00000-ffffffff : Reserved
   fec00000-fec003ff : IOAPIC 0
-  fec00800-fec00807 : SP5100 TCO fallback
+  fec00400-fec00407 : SP5100 TCO
 ```
 
 The AMD PM registers are reprogrammed to:
 
 ```text
 PM 0x6c = 0x00
-PM 0x6d = 0x08
+PM 0x6d = 0x04
 PM 0x6e = 0xc0
 PM 0x6f = 0xfe
 ```
 
-which is little-endian `0xfec00800`.
+which is little-endian `0xfec00400` on the tested system.
 
 ## Result
 
 With the patched driver:
 
 ```text
-sp5100-tco: Failed to reserve MMIO or alternate MMIO region
-sp5100-tco: Reprogrammed legacy SP5100 watchdog MMIO to 0xfec00800
-sp5100-tco: Using relocated 0xfec00800 for watchdog MMIO address
+sp5100-tco: Relocated legacy SP5100 watchdog MMIO from 0xfec000f0 to 0xfec00400
+sp5100-tco: Using relocated 0xfec00400 for watchdog MMIO address
 sp5100-tco: initialized. heartbeat=60 sec (nowayout=0)
 ```
 
@@ -186,7 +188,7 @@ ls -l /dev/watchdog*
 Inspect the MMIO resource:
 
 ```bash
-sudo grep -i -B3 -A5 'fec00800' /proc/iomem
+sudo grep -i -A10 '^fec00000' /proc/iomem
 ```
 
 ## PM register diagnostic helper
@@ -211,7 +213,7 @@ Verified:
 * this address conflicts with the IOAPIC resource
 * the current driver fails with `-EBUSY`
 * the fallback path is entered
-* the watchdog can be relocated to `0xfec00800`
+* the watchdog can be relocated to a dynamically selected free 8-byte MMIO window
 * PM registers `0x6c..0x6f` are reprogrammed
 * the resource is represented correctly in `/proc/iomem`
 * `sp5100_tco` initializes successfully
@@ -223,10 +225,9 @@ A deliberate hardware watchdog timeout/reset has not yet been tested.
 
 This is currently an experimental and hardware-specific implementation.
 
-The fallback address `0xfec00800` is explicitly selected for the tested
-platform. A production or upstream implementation should locate and validate
-a suitable free child region instead of assuming this address is universally
-safe.
+The fallback address is selected dynamically from free child space inside
+the existing firmware-reserved MMIO parent. No board-specific replacement
+address is hard-coded.
 
 Do not use this code on unrelated hardware without understanding the AMD
 southbridge watchdog and MMIO resource layout involved.
