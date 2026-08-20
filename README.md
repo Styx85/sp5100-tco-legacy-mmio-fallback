@@ -39,9 +39,15 @@ relevant difference is that the old relocation path reprogrammed the watchdog
 base but did not restore the firmware-programmed PM register state when the
 driver was removed.
 
-This repository therefore implements relocation as a reversible operation:
-the original PM control and base registers are saved before reprogramming and
-restored on probe failure or device removal.
+This repository therefore implements relocation as a reversible operation.
+The original PM control and base registers and the PCI watchdog decode state
+are saved before reprogramming and restored on probe failure or device
+removal.
+
+The v2 implementation also avoids direct traversal of the global iomem
+resource tree, uses the normal resource API for exclusive MMIO reservation,
+bounds the relocation search, and disables PCI watchdog MMIO decode while the
+byte-wise watchdog base registers are rewritten.
 
 ## Tested hardware
 
@@ -82,8 +88,12 @@ This address overlaps the IOAPIC kernel resource.
 
 ## Relocation
 
-The experimental fallback dynamically locates a free, naturally aligned
-8-byte child resource inside the existing firmware-reserved MMIO parent.
+The fallback searches a bounded 4 KiB window above the conflicting firmware
+address for a free, naturally aligned 8-byte MMIO range.
+
+Candidates are reserved with `devm_request_mem_region()`, so resource-tree
+locking, conflict handling and `IORESOURCE_BUSY` semantics are provided by the
+kernel resource core.
 
 On the tested system the first available range is:
 
@@ -268,9 +278,14 @@ Verified:
 * the resource is represented correctly in `/proc/iomem`
 * `sp5100_tco` initializes successfully
 * `/dev/watchdog0` is registered
-* the original PM control and base registers are restored on module removal
+* PCI watchdog MMIO decode is disabled while BASE0..3 are reprogrammed
+* the original PM control, base registers and PCI decode state are restored
+  on module removal
 * the relocated resource disappears from `/proc/iomem` on module removal
-* the final upstream patch passes `checkpatch.pl --strict` with 0 errors,
+* a warm reboot with the relocated watchdog loaded completed successfully
+* after the warm reboot the firmware watchdog state was again `0xfec000f0`
+  with PM control `0x03`
+* the v2 upstream patch passes `checkpatch.pl --strict` with 0 errors,
   0 warnings and 0 checks
 
 A deliberate hardware watchdog timeout/reset has not yet been tested.
