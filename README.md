@@ -1,4 +1,3 @@
-````markdown
 # sp5100-tco GA-78LMT-USB3 MMIO quirk
 
 Linux `sp5100_tco` watchdog driver patch adding a narrowly scoped DMI quirk
@@ -305,6 +304,4 @@ generic watchdog MMIO relocation.
 
 The patch is intended as a board-specific compatibility fix for the
 GA-78LMT-USB3 firmware/resource conflict.
-
-````
 
